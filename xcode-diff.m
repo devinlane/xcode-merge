@@ -92,12 +92,19 @@ NSDictionary *dictionary_merge3(NSDictionary *base, NSDictionary *local, NSDicti
 NSArray *array_merge3(NSArray *base, NSArray *local, NSArray *remote, BOOL *fail)
 {
     NSMutableArray *merged = [NSMutableArray array];
-    NSMutableSet *allItems = [NSMutableSet set];
+    NSMutableSet *seenItems = [NSMutableSet set];
+    
+    /* We use an array here to preserve order */
+    NSMutableArray *allItems = [NSMutableArray array];
     [allItems addObjectsFromArray:base];
     [allItems addObjectsFromArray:local];
     [allItems addObjectsFromArray:remote];
     
     for (id item in allItems) {
+        /* Make sure we only hit each item once */
+        if ([seenItems containsObject:item]) continue;
+        [seenItems addObject:item];
+        
         id bItem = [base containsObject:item] ? item : nil;
         id lItem = [local containsObject:item] ? item : nil;
         id rItem = [remote containsObject:item] ? item : nil;
