@@ -2,17 +2,57 @@
 
 typedef struct {
     /* The dictionary of objects for base, local, and remote */
-    NSDictionary *base;
-    NSDictionary *local;
-    NSDictionary *remote;
+    NSMutableDictionary *base;
+    NSMutableDictionary *local;
+    NSMutableDictionary *remote;
     
-    /* The merged object dictionary */
+    /* The erged object dictionary */
     NSMutableDictionary *merged;
     
     BOOL interactive;
 } Context;
 
-Context ctx;
+static Context ctx;
+
+@interface NSArray (xcodediff)
+
+- (id)firstObject;
+
+@end
+
+@implementation NSArray (xcodediff)
+
+- (id)firstObject
+{
+    return (self.count ? [self objectAtIndex:0] : nil);
+}
+
+@end
+
+
+@interface NSDictionary (xcodediff)
+
+- (NSArray *)objectsForKeys:(id <NSFastEnumeration>)keys notFoundMarker:(id)marker;
+
+@end
+
+@implementation NSDictionary (xcodediff)
+
+- (NSArray *)objectsForKeys:(id <NSFastEnumeration>)keys notFoundMarker:(id)marker
+{
+    NSMutableArray *array = [NSMutableArray array];
+    
+    for (id key in keys) {
+        id res = [self objectForKey:key];
+        if (res || marker) {
+            [array addObject:res ?: marker];
+        }
+    }
+    
+    return array;
+}
+
+@end
 
 NSArray *uuid_keys_for_isa(NSString *isa)
 {
@@ -36,6 +76,9 @@ NSArray *uuid_keys_for_isa(NSString *isa)
 
 id merge_conflict(NSString *key, id base, id local, id remote, id context, BOOL *fail)
 {
+    /* Conflicts fail the merge if the user has no input. */
+    if (!ctx.interactive) return nil;
+    
     printf("Merge conflict on key: %s base: %s\n", [[key description] UTF8String], [[base description] UTF8String]);
     printf("Left: %s\nRight: %s\n", [[local description] UTF8String], [[remote description] UTF8String]);
     
@@ -62,49 +105,16 @@ id merge_conflict(NSString *key, id base, id local, id remote, id context, BOOL 
 }
 
 id element_merge3(NSString *key, id base, id local, id remote, id context, BOOL *fail);
-
-NSDictionary *dictionary_merge3(NSDictionary *base, NSDictionary *local, NSDictionary *remote, BOOL *fail)
-{
-    /* A real merge! Gather all keys and perform a recursive merge. */
-    NSMutableDictionary *merged = [NSMutableDictionary dictionary];
-    NSMutableSet *allKeys = [NSMutableSet set];
-    [allKeys addObjectsFromArray:[base allKeys]];
-    [allKeys addObjectsFromArray:[local allKeys]];
-    [allKeys addObjectsFromArray:[remote allKeys]];
-
-    for (NSString *key in allKeys) {
-        id bValue = [base objectForKey:key];
-        id lValue = [local objectForKey:key];
-        id rValue = [remote objectForKey:key];
-        
-        id result = element_merge3(key, bValue, lValue, rValue, (base ?: (local ?: remote)), fail);
-        
-        if (result) {
-            [merged setObject:result forKey:key];
-        }
-        
-        if (*fail) break;
-    }
-    
-    return merged;
-}
+NSArray *merge_array_preserving_order3(NSArray *base, NSArray *local, NSArray *remote);
 
 NSArray *array_merge3(NSArray *base, NSArray *local, NSArray *remote, BOOL *fail)
 {
     NSMutableArray *merged = [NSMutableArray array];
-    NSMutableSet *seenItems = [NSMutableSet set];
-    
-    /* We use an array here to preserve order */
-    NSMutableArray *allItems = [NSMutableArray array];
-    [allItems addObjectsFromArray:base];
-    [allItems addObjectsFromArray:local];
-    [allItems addObjectsFromArray:remote];
+
+    /* The resulting array preserves order and is uniqued. */
+    NSArray *allItems = merge_array_preserving_order3(base, local, remote);
     
     for (id item in allItems) {
-        /* Make sure we only hit each item once */
-        if ([seenItems containsObject:item]) continue;
-        [seenItems addObject:item];
-        
         id bItem = [base containsObject:item] ? item : nil;
         id lItem = [local containsObject:item] ? item : nil;
         id rItem = [remote containsObject:item] ? item : nil;
@@ -119,6 +129,194 @@ NSArray *array_merge3(NSArray *base, NSArray *local, NSArray *remote, BOOL *fail
     
     return merged;    
 }
+
+NSArray *merge_array_preserving_order2(NSArray *left, NSArray *right)
+{
+    NSMutableArray *merged = [NSMutableArray arrayWithArray:left];
+    NSMutableArray *buffer = [NSMutableArray array];
+    
+    NSInteger lastIndex = 0;
+    for (id object in right) {
+        NSInteger index = [merged indexOfObject:object];
+        
+        if (index == NSNotFound) {
+            [buffer addObject:object];
+        } else {
+            if (buffer.count) {
+                for (id obj in buffer) {
+                    [merged insertObject:obj atIndex:index++];
+                }
+                [buffer removeAllObjects];
+            }
+            
+            lastIndex = index + 1;
+        }
+    }
+    
+    if (buffer.count) {
+        for (id obj in buffer) {
+            [merged insertObject:obj atIndex:lastIndex++];
+        }
+        [buffer removeAllObjects];
+    }
+    
+    return merged;
+}
+
+NSArray *merge_array_preserving_order3(NSArray *base, NSArray *local, NSArray *remote)
+{
+    return merge_array_preserving_order2(merge_array_preserving_order2(base, local), remote);
+}
+
+NSArray *group_array_merge3(NSArray *base, NSArray *local, NSArray *remote, BOOL *fail)
+{
+    NSArray *allItems = array_merge3(base, local, remote, fail);
+    if (*fail) return nil;
+    
+    NSMutableArray *objects = [NSMutableArray array];
+    NSMutableArray *objectIdentifiers = [NSMutableArray array];
+    NSMutableDictionary *namesToIdentifiers = [NSMutableDictionary dictionary];
+    
+    /* Each of these array items is a identifier for either a group or a file. We examine
+     * these items to determine a unique set of names. (It is unlikely that a project would have 
+     * more than one item (of the same type) in a group with the same name.) If we find two (or more?) 
+     * groups with the same name, we merge them together and use that merged group. */
+     
+    /* The task is to 
+     *		a) for each of the items, find the associated group/file object.
+     * 		b) for each object, merge the name.
+     * 		c) group these names by type and unique.
+     * 		c) */
+    for (id item in allItems) {
+        /* a) for each of the items, find the associated group/file object.
+         * b) for each object, merge the name.*/
+        id mergedObject = [ctx.merged objectForKey:item];
+        if (!mergedObject) {
+            mergedObject = element_merge3(nil, [ctx.base objectForKey:item], [ctx.local objectForKey:item], 
+                                          [ctx.remote objectForKey:item], nil, fail);
+        }
+        if (*fail) return nil;
+        if (!mergedObject) continue;
+        
+        /* Keep track of this object and associated identifier */
+        [objects addObject:mergedObject];
+        [objectIdentifiers addObject:item];
+        
+        /* c) group these names by type and unique. */
+        NSString *name;
+        NSString *type = [mergedObject objectForKey:@"isa"];
+        name = [mergedObject objectForKey:@"path"];
+        if (!name) {
+            name = [mergedObject objectForKey:@"name"];
+        }
+                
+        NSString *key = [NSString stringWithFormat:@"%@%@", name, type];
+        
+        NSMutableSet *identifiers = [namesToIdentifiers objectForKey:key];
+        if (!identifiers) {
+            identifiers = [NSMutableSet set];
+            [namesToIdentifiers setObject:identifiers forKey:key];
+        }
+        
+        [identifiers addObject:item];
+    }
+    
+    /* For each merged object, we now check for duplicates and merge them together */
+    NSDictionary *identifierToObject = [NSDictionary dictionaryWithObjects:objects forKeys:objectIdentifiers];
+    for (NSString *identifier in objectIdentifiers) {
+        NSDictionary *item = [identifierToObject objectForKey:identifier];
+        
+        NSString *name;
+        NSString *type = [item objectForKey:@"isa"];
+        name = [item objectForKey:@"path"];
+        if (!name) {
+            name = [item objectForKey:@"name"];
+        }
+        
+        
+        
+        NSString *key = [NSString stringWithFormat:@"%@%@", name, type];
+        
+        NSSet *identifiers = [namesToIdentifiers objectForKey:key];
+        if (identifiers.count) {
+            if ([name isEqualToString:@"App"]) {
+                NSLog(@"merged an App!");
+            }
+            
+            /* If we've already merged for these identifiers, we're done */
+            id mergedMember = [[ctx.merged objectsForKeys:[identifiers allObjects] notFoundMarker:nil] firstObject];
+            if (mergedMember && [mergedMember objectForKey:@"__merged"]) continue;
+            
+            /* Find the candidate members */
+            id baseMember = [[ctx.base objectsForKeys:[identifiers allObjects] notFoundMarker:nil] firstObject];
+            id localMember = [[ctx.local objectsForKeys:[identifiers allObjects] notFoundMarker:nil] firstObject];
+            id remoteMember = [[ctx.remote objectsForKeys:[identifiers allObjects] notFoundMarker:nil] firstObject];
+            
+            /* Get some merging action on */
+            id result = element_merge3(identifier, baseMember, localMember, remoteMember, nil, fail);
+            if (*fail) return nil;
+            
+            if ([name isEqualToString:@"App"]) {
+                NSLog(@"merged an App!");
+            }
+            
+            [result setObject:(id)kCFBooleanTrue forKey:@"__merged"];
+            [ctx.merged setObject:result forKey:identifier];
+            
+            /* Now we have to nuke the other objects with this identifier so that we don't
+             * try to include them again */
+            NSArray *otherIdentifiers = [[identifiers allObjects] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self != %@", identifier]];
+            [ctx.base removeObjectsForKeys:otherIdentifiers];
+            [ctx.local removeObjectsForKeys:otherIdentifiers];
+            [ctx.remote removeObjectsForKeys:otherIdentifiers];
+        }
+    }
+    
+    return objectIdentifiers;
+}
+
+NSArray *files_array_merge3(NSArray *base, NSArray *local, NSArray *remote, BOOL *fail)
+{
+    return array_merge3(base, local, remote, fail);
+}
+
+NSDictionary *dictionary_merge3(NSDictionary *base, NSDictionary *local, NSDictionary *remote, BOOL *fail)
+{
+    /* A real merge! Gather all keys and perform a recursive merge. */
+    NSMutableDictionary *merged = [NSMutableDictionary dictionary];
+    NSMutableSet *allKeys = [NSMutableSet set];
+    [allKeys addObjectsFromArray:[base allKeys]];
+    [allKeys addObjectsFromArray:[local allKeys]];
+    [allKeys addObjectsFromArray:[remote allKeys]];
+    
+    NSString *isa = [(base ?: (local ?: remote)) objectForKey:@"isa"];
+    BOOL isGroup = [isa hasSuffix:@"Group"] || [isa isEqualToString:@"PBXResourcesBuildPhase"];
+    
+    for (NSString *key in allKeys) {
+        id bValue = [base objectForKey:key];
+        id lValue = [local objectForKey:key];
+        id rValue = [remote objectForKey:key];
+        
+        id result;
+        
+        if (isGroup && [key isEqualToString:@"children"]) {
+            result = group_array_merge3(bValue, lValue, rValue, fail);
+        } else if (isGroup && [key isEqualToString:@"files"]) {
+            result = files_array_merge3(bValue, lValue, rValue, fail);
+        } else {
+            result = element_merge3(key, bValue, lValue, rValue, (base ?: (local ?: remote)), fail);
+        }
+        
+        if (result) {
+            [merged setObject:result forKey:key];
+        }
+        
+        if (*fail) break;
+    }
+    
+    return merged;
+}
+
 
 id element_merge3(NSString *key, id base, id local, id remote, id context, BOOL *fail)
 {
@@ -160,10 +358,8 @@ id element_merge3(NSString *key, id base, id local, id remote, id context, BOOL 
     return result;
 }
 
-NSDictionary *objects_merge3(NSDictionary *base, NSDictionary *local, NSDictionary *remote)
+BOOL objects_merge3(NSDictionary *base, NSDictionary *local, NSDictionary *remote)
 {
-    NSMutableDictionary *mergedObjects = [NSMutableDictionary dictionary];
-    
     /* First, get aggregate set of keys */
     NSMutableSet *allKeys = [NSMutableSet set];
     [allKeys addObjectsFromArray:[base allKeys]];
@@ -172,35 +368,44 @@ NSDictionary *objects_merge3(NSDictionary *base, NSDictionary *local, NSDictiona
     
     /* Iterate over all keys */
     for (NSString *key in allKeys) {
+        /* The object could already be merged in -- this can happen
+         * with duplicate groups. The object will be force merged in by the 
+         * group_merge method above */
+        if ([ctx.merged objectForKey:key]) continue;
+        
         BOOL fail = NO;
         NSDictionary *result = element_merge3(key, [base objectForKey:key], [local objectForKey:key], [remote objectForKey:key], nil, &fail);
         
         /* If we didn't resolve a conflict */
-        if (fail) return nil;
+        if (fail) return NO;
         
         if (result) {
             /* Merge in new entries */
-            [mergedObjects setObject:result forKey:key];
+            [ctx.merged setObject:result forKey:key];
         }
     }
     
-    return mergedObjects;
+    return YES;
 }
 
-NSDictionary *project_file_merge3(NSDictionary *base, NSDictionary *local, NSDictionary *remote)
+id project_file_merge3(NSDictionary *base, NSDictionary *local, NSDictionary *remote)
 {
+    ctx.base = [base objectForKey:@"objects"];
+    ctx.local = [local objectForKey:@"objects"];
+    ctx.remote = [remote objectForKey:@"objects"];
+    ctx.merged = [NSMutableDictionary dictionary];
+    
     NSMutableDictionary *document = [NSMutableDictionary dictionaryWithDictionary:base];
     
     /* Merge elements */
-    NSDictionary *mergedObjects = objects_merge3([base objectForKey:@"objects"], [local objectForKey:@"objects"], [remote objectForKey:@"objects"]);
-    if (!mergedObjects) return nil;
-    
+    if (!objects_merge3(ctx.base, ctx.local, ctx.remote)) return nil;
+
     /* Put the elements in our document */
-    [document setObject:mergedObjects forKey:@"objects"];
+    [document setObject:ctx.merged forKey:@"objects"];
     
     /* Find project element and enforce root object */
-    NSDictionary *project = [[[mergedObjects allValues] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"isa = %@", @"PBXProject"]] objectAtIndex:0];
-    [document setObject:[[mergedObjects allKeysForObject:project] objectAtIndex:0] forKey:@"rootObject"];
+    NSDictionary *project = [[[ctx.merged allValues] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"isa = %@", @"PBXProject"]] objectAtIndex:0];
+    [document setObject:[[ctx.merged allKeysForObject:project] objectAtIndex:0] forKey:@"rootObject"];
     
     return document;
 }
@@ -256,6 +461,27 @@ NSData *serialize_ascii_plist(NSDictionary *base)
 }
 
 #if 0
+
+int main (int argc, const char * argv[]) {
+    NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
+
+    NSArray *left = [@"a,b,c,d" componentsSeparatedByString:@","];
+    NSArray *right = [@"a,e,f,b,c,g,h,i" componentsSeparatedByString:@","];
+    
+    NSLog(@"\nleft: %@\nright: %@\nresult: %@", left, right, merge_array_preserving_order2(left, right));
+    
+    left = nil;
+    right = [@"a,b,c,d" componentsSeparatedByString:@","];
+    
+    NSLog(@"\nleft: %@\nright: %@\nresult: %@", left, right, merge_array_preserving_order2(left, right));
+    
+    [pool drain];
+    return 0;
+}
+    
+
+#elif 0
+
 int main (int argc, const char * argv[]) {
     NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
 
@@ -284,7 +510,7 @@ int main (int argc, const char * argv[]) {
     return 0;
 }
 
-#endif
+#else
 
 int main (int argc, const char * argv[]) {
     NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
@@ -298,21 +524,25 @@ int main (int argc, const char * argv[]) {
         exit(1);
     }
     
+    if (strcmp(argv[1], "-i") == 0) {
+        ctx.interactive = YES;
+        argv++;
+    }
+    
     /* Load dictionaries */
     NSDictionary *dicts[3];
     for (NSUInteger i = 0; i < 3; i++) {
         NSString *path = [NSString stringWithUTF8String:argv[i + 1]];
         dicts[i] = [NSPropertyListSerialization propertyListFromData:[NSData dataWithContentsOfFile:path] 
-                                                    mutabilityOption:NSPropertyListImmutable 
+                                                    mutabilityOption:NSPropertyListMutableContainers
                                                               format:NULL 
                                                     errorDescription:NULL];
     }
     
     
-    /* Do the merge */
-    NSDictionary *result = project_file_merge3(dicts[0], dicts[1], dicts[2]);
+    /* Do the merge, exiting with a status code of 1 on failure */
+    id result = project_file_merge3(dicts[0], dicts[1], dicts[2]);
     
-    /* If we failed, exit with a non-zero return */
     if (!result) return 1;
     
     /* Write the merged data */
@@ -324,3 +554,5 @@ int main (int argc, const char * argv[]) {
     [pool drain];
     return 0;
 }
+
+#endif
